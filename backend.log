@@ -1,0 +1,29 @@
+
+✓ Hospital Management System Backend
+✓ Server running on http://localhost:5000
+✓ ZKP Authentication enabled
+
+[2025-11-23T09:25:30.402Z] Server started
+
+[2025-11-23T10:25:42.281Z] POST /api/auth/register
+[2025-11-23T10:25:42.706Z] POST /api/auth/login
+[2025-11-23T10:26:09.370Z] GET /src/index.jsx
+[2025-11-23T10:26:45.129Z] POST /api/auth/register
+[2025-11-23T10:26:45.155Z] POST /api/auth/login
+[2025-11-23T10:26:51.979Z] POST /api/auth/register
+[2025-11-23T10:26:52.007Z] POST /api/auth/login
+[2025-11-23T11:13:34.432Z] GET /api/health
+[2025-11-23T11:13:34.447Z] POST /api/auth/register
+[2025-11-23T11:13:34.466Z] POST /api/auth/register
+[2025-11-23T11:13:34.476Z] POST /api/auth/register
+[2025-11-23T11:13:34.487Z] POST /api/auth/register
+[2025-11-23T11:13:34.492Z] POST /api/auth/login
+[2025-11-23T11:13:34.498Z] POST /api/auth/register
+[2025-11-23T11:13:34.508Z] POST /api/auth/register
+[2025-11-23T11:13:34.512Z] POST /api/auth/register
+[2025-11-23T11:13:34.520Z] POST /api/auth/register
+[2025-11-23T11:13:34.526Z] POST /api/auth/register
+[2025-11-23T11:13:34.532Z] POST /api/auth/register
+[2025-11-23T11:13:34.539Z] POST /api/auth/register
+[2025-11-23T11:13:34.544Z] POST /api/auth/register
+[2025-11-23T11:13:34.549Z] POST /api/auth/register
