@@ -77,7 +77,7 @@ router.get('/patients', authMiddleware, roleMiddleware('receptionist'), async (r
       LIMIT 100
     `);
     
-    console.log(`✅ Found ${patients.length} patients`);
+    console.log(`✅ Found ${patients.length} patients`, patients.slice(0, 3));
     res.json({ success: true, patients: patients || [] });
   } catch (error) {
     console.error('❌ ERROR in /patients:', error.message);
@@ -91,12 +91,12 @@ router.get('/doctors/available', authMiddleware, roleMiddleware('receptionist'),
     console.log('🔍 [DOCTORS] Fetching from database...');
     
     const [doctors] = await db.query(`
-      SELECT d.id, d.specialization, d.available_slots, u.first_name, u.last_name, u.email
+      SELECT d.id, u.first_name, u.last_name, u.email, d.specialization, d.available_slots
       FROM doctors d
       JOIN users u ON d.user_id = u.id
     `);
     
-    console.log(`✅ Found ${doctors.length} doctors`);
+    console.log(`✅ Found ${doctors.length} doctors`, doctors.slice(0, 3));
     res.json({ success: true, doctors: doctors || [] });
   } catch (error) {
     console.error('❌ ERROR in /doctors:', error.message);
@@ -109,14 +109,32 @@ router.post('/appointments/book', authMiddleware, roleMiddleware('receptionist')
   try {
     const { patientId, doctorId, appointmentDate, reason } = req.body;
 
+    // Validate inputs
+    if (!patientId || !doctorId || !appointmentDate || !reason) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
+
+    // Validate that patient exists
+    const [patient] = await db.query('SELECT id FROM patients WHERE id = ?', [patientId]);
+    if (patient.length === 0) {
+      return res.status(400).json({ error: 'Patient not found' });
+    }
+
+    // Validate that doctor exists and get the doctor table ID
+    const [doctor] = await db.query('SELECT id FROM doctors WHERE id = ?', [doctorId]);
+    if (doctor.length === 0) {
+      return res.status(400).json({ error: 'Doctor not found' });
+    }
+
     const [result] = await db.query(
       `INSERT INTO appointments (patient_id, doctor_id, appointment_date, reason, status)
        VALUES (?, ?, ?, ?, 'scheduled')`,
       [patientId, doctorId, appointmentDate, reason]
     );
 
-    res.json({ success: true, message: 'Appointment booked', appointmentId: result.insertId });
+    res.json({ success: true, message: 'Appointment booked successfully', appointmentId: result.insertId });
   } catch (error) {
+    console.error('Appointment booking error:', error);
     res.status(500).json({ error: error.message });
   }
 });

@@ -89,27 +89,35 @@ class AuthController {
     static async login(req, res) {
         try {
             const { username, password } = req.body;
+            console.log(`\n🔐 LOGIN ATTEMPT: username="${username}"`);
             
             if (!username || !password) {
+                console.log('❌ Missing credentials');
                 return res.status(400).json({ error: 'Username and password required' });
             }
             
             // Get user and password hash
             const [users] = await db.query(
-                'SELECT id, username, role, password_hash FROM users WHERE username = ?',
+                'SELECT id, username, role, password_hash, first_name, last_name FROM users WHERE username = ?',
                 [username]
             );
             
+            console.log(`✅ Users found: ${users.length}`);
+            
             if (users.length === 0) {
+                console.log('❌ User not found');
                 return res.status(401).json({ error: 'Invalid credentials' });
             }
             
             const user = users[0];
+            console.log(`✅ User found: ID=${user.id}, Role=${user.role}`);
             
             // Verify password by comparing hashes
             const isValid = SimpleHashAuth.verifyPassword(password, user.password_hash);
+            console.log(`🔍 Password verification: ${isValid ? '✅ VALID' : '❌ INVALID'}`);
             
             if (!isValid) {
+                console.log('❌ Password mismatch');
                 return res.status(401).json({ error: 'Invalid credentials' });
             }
             
@@ -123,6 +131,8 @@ class AuthController {
                 process.env.JWT_SECRET,
                 { expiresIn: process.env.TOKEN_EXPIRY || '24h' }
             );
+            
+            console.log(`✅ Token generated successfully`);
             
             res.json({
                 success: true,

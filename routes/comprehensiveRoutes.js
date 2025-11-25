@@ -1,9 +1,19 @@
 const express = require('express');
 const axios = require('axios');
+const { GoogleGenerativeAI } = require('@google/generative-ai');
 const db = require('../config/database');
 const { authMiddleware, roleMiddleware } = require('../middleware/authMiddleware');
 
 const router = express.Router();
+
+// Function to get Gemini AI instance
+const getGeminiAI = () => {
+    const apiKey = process.env.GEMINI_API_KEY || 'AIzaSyAKaDkSal6cEfifpbKD48GkHAH8yFjomnU';
+    if (!apiKey || apiKey.trim() === '') {
+        throw new Error('GEMINI_API_KEY is not configured');
+    }
+    return new GoogleGenerativeAI(apiKey);
+};
 
 // ============================================
 // DOCTOR ENDPOINTS
@@ -86,6 +96,196 @@ router.get('/doctor/patient/:patientId', authMiddleware, roleMiddleware('doctor'
         });
     } catch (error) {
         res.status(500).json({ error: error.message });
+    }
+});
+
+// Doctor: Get AI suggestions for patient (diagnosis differentials, test recommendations, drug guidelines)
+router.post('/doctor/patient/:patientId/ai-suggestions', authMiddleware, roleMiddleware('doctor'), async (req, res) => {
+    try {
+        const { patientId } = req.params;
+        
+        // Initialize Gemini AI
+        const genAI = getGeminiAI();
+        
+        // Get patient data
+        const [patient] = await db.query(
+            `SELECT p.*, u.first_name, u.last_name, u.email, u.username
+             FROM patients p
+             JOIN users u ON p.user_id = u.id
+             WHERE p.id = ?`,
+            [patientId]
+        );
+        
+        if (patient.length === 0) {
+            return res.status(404).json({ error: 'Patient not found' });
+        }
+        
+        const [diagnoses] = await db.query(
+            'SELECT * FROM diagnoses WHERE patient_id = ? ORDER BY created_at DESC',
+            [patientId]
+        );
+        
+        const [prescriptions] = await db.query(
+            `SELECT pr.*, m.name as medication_name, m.strength
+             FROM prescriptions pr
+             JOIN medications m ON pr.medication_id = m.id
+             WHERE pr.patient_id = ? ORDER BY pr.created_at DESC LIMIT 10`,
+            [patientId]
+        );
+        
+        const [vitals] = await db.query(
+            'SELECT * FROM vital_signs WHERE patient_id = ? ORDER BY recorded_at DESC LIMIT 5',
+            [patientId]
+        );
+        
+        // Prepare patient data summary for AI
+        const patientData = {
+            name: `${patient[0].first_name} ${patient[0].last_name}`,
+            age: patient[0].date_of_birth ? new Date().getFullYear() - new Date(patient[0].date_of_birth).getFullYear() : 'Unknown',
+            bloodGroup: patient[0].blood_group || 'Unknown',
+            allergies: patient[0].allergies || 'None known',
+            diagnoses: diagnoses.map(d => ({
+                name: d.diagnosis_name,
+                icdCode: d.icd_code,
+                severity: d.severity,
+                description: d.description,
+                date: d.created_at
+            })),
+            prescriptions: prescriptions.map(p => ({
+                medication: p.medication_name,
+                strength: p.strength,
+                dosage: p.dosage,
+                frequency: p.frequency,
+                duration: p.duration
+            })),
+            vitals: vitals.length > 0 ? {
+                temperature: vitals[0].temperature,
+                heartRate: vitals[0].heart_rate,
+                bloodPressure: `${vitals[0].blood_pressure_systolic}/${vitals[0].blood_pressure_diastolic}`,
+                oxygenSaturation: vitals[0].oxygen_saturation
+            } : null
+        };
+        
+        // Create prompt for Gemini
+        const prompt = `You are a medical AI assistant helping a doctor with patient analysis. Based on the following patient information, provide:
+
+1. **Possible Diagnosis Differentials**: List 3-5 potential diagnoses based on the patient's symptoms, current diagnoses, prescriptions, and vital signs. For each, provide:
+   - Diagnosis name
+   - Likelihood (High/Medium/Low)
+   - Brief reasoning
+
+2. **Test Recommendations**: Suggest relevant diagnostic tests that would help confirm or rule out the differential diagnoses. Include:
+   - Test name
+   - Purpose/reason
+   - Priority (High/Medium/Low)
+
+3. **Drug Guidelines**: Review the current prescriptions and provide:
+   - Drug interaction warnings (if any)
+   - Dosage appropriateness
+   - Recommendations for adjustments (if needed)
+   - Contraindications based on patient allergies
+
+Patient Information:
+- Name: ${patientData.name}
+- Age: ${patientData.age}
+- Blood Group: ${patientData.bloodGroup}
+- Allergies: ${patientData.allergies}
+
+Current Diagnoses:
+${patientData.diagnoses.length > 0 ? patientData.diagnoses.map(d => `- ${d.name} (${d.icdCode}): ${d.severity} - ${d.description}`).join('\n') : 'None recorded'}
+
+Current Prescriptions:
+${patientData.prescriptions.length > 0 ? patientData.prescriptions.map(p => `- ${p.medication} (${p.strength}): ${p.dosage}, ${p.frequency}, Duration: ${p.duration}`).join('\n') : 'None'}
+
+Latest Vital Signs:
+${patientData.vitals ? `- Temperature: ${patientData.vitals.temperature}°F\n- Heart Rate: ${patientData.vitals.heartRate} bpm\n- Blood Pressure: ${patientData.vitals.bloodPressure} mmHg\n- Oxygen Saturation: ${patientData.vitals.oxygenSaturation}%` : 'Not available'}
+
+Please format your response as a JSON object with the following structure:
+{
+  "diagnosisDifferentials": [
+    {
+      "diagnosis": "Diagnosis name",
+      "likelihood": "High/Medium/Low",
+      "reasoning": "Brief explanation"
+    }
+  ],
+  "testRecommendations": [
+    {
+      "test": "Test name",
+      "purpose": "Why this test is recommended",
+      "priority": "High/Medium/Low"
+    }
+  ],
+  "drugGuidelines": {
+    "interactions": ["Any drug interactions"],
+    "dosageReview": "Review of current dosages",
+    "recommendations": ["Any recommendations"],
+    "contraindications": ["Any contraindications based on allergies"]
+  }
+}`;
+
+        // Get Gemini model - try different model names in order
+        const modelNames = ['gemini-2.5-flash', 'gemini-2.5-pro', 'gemini-pro-latest', 'gemini-flash-latest'];
+        let text = null;
+        let lastError = null;
+        
+        for (const modelName of modelNames) {
+            try {
+                console.log(`Attempting to use Gemini model: ${modelName}`);
+                const model = genAI.getGenerativeModel({ model: modelName });
+                
+                const result = await model.generateContent(prompt);
+                const response = await result.response;
+                text = response.text();
+                console.log(`Successfully got response from ${modelName}`);
+                break;
+            } catch (apiError) {
+                console.error(`Model ${modelName} failed:`, apiError.message);
+                lastError = apiError;
+                continue;
+            }
+        }
+        
+        if (!text) {
+            let errorMsg = lastError?.message || 'Unknown error';
+            if (errorMsg.includes('403')) {
+                errorMsg = 'API key does not have permission to access Gemini models. Please check: 1) API key is valid, 2) Generative Language API is enabled in Google Cloud Console, 3) API key has proper permissions.';
+            } else if (errorMsg.includes('404')) {
+                errorMsg = 'Gemini models not found. The API key may be invalid or the models are not available in your region.';
+            } else if (errorMsg.includes('401')) {
+                errorMsg = 'API key is invalid or expired. Please check your GEMINI_API_KEY.';
+            }
+            throw new Error(`Failed to generate AI suggestions: ${errorMsg}`);
+        }
+        
+        // Try to parse JSON from response
+        let aiSuggestions;
+        try {
+            const jsonMatch = text.match(/```json\s*([\s\S]*?)\s*```/) || text.match(/```\s*([\s\S]*?)\s*```/) || [null, text];
+            const jsonText = jsonMatch[1] || text;
+            aiSuggestions = JSON.parse(jsonText);
+        } catch (parseError) {
+            aiSuggestions = {
+                rawResponse: text,
+                error: "Could not parse structured response"
+            };
+        }
+        
+        res.json({
+            success: true,
+            suggestions: aiSuggestions,
+            patientData: {
+                name: patientData.name,
+                diagnosesCount: diagnoses.length,
+                prescriptionsCount: prescriptions.length
+            }
+        });
+    } catch (error) {
+        console.error('AI Suggestions Error:', error);
+        res.status(500).json({ 
+            error: 'Failed to generate AI suggestions', 
+            details: error.message 
+        });
     }
 });
 
@@ -208,6 +408,345 @@ router.get('/patient/my-records', authMiddleware, roleMiddleware('patient'), asy
         });
     } catch (error) {
         res.status(500).json({ error: error.message });
+    }
+});
+
+// Patient: Get AI analysis for a single prescription/document
+router.post('/patient/prescription/:prescriptionId/ai-analysis', authMiddleware, roleMiddleware('patient'), async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const { prescriptionId } = req.params;
+        
+        // Get patient info
+        const [patient] = await db.query('SELECT id, allergies FROM patients WHERE user_id = ?', [userId]);
+        if (patient.length === 0) {
+            return res.status(404).json({ error: 'Patient profile not found' });
+        }
+        
+        const patientId = patient[0].id;
+        const allergies = patient[0].allergies || 'None known';
+        
+        // Check if it's a database prescription or uploaded document
+        const [prescription] = await db.query(
+            `SELECT pr.*, m.name as medication_name, m.strength 
+             FROM prescriptions pr
+             JOIN medications m ON pr.medication_id = m.id
+             WHERE pr.id = ? AND pr.patient_id = ?`,
+            [prescriptionId, patientId]
+        );
+        
+        let prescriptionData = null;
+        let isUploadedDoc = false;
+        
+        if (prescription.length > 0) {
+            // It's a database prescription
+            prescriptionData = {
+                medication: prescription[0].medication_name,
+                strength: prescription[0].strength,
+                dosage: prescription[0].dosage,
+                frequency: prescription[0].frequency,
+                duration: prescription[0].duration,
+                instructions: prescription[0].instructions || 'None provided',
+                source: 'database'
+            };
+        } else {
+            // Check if it's an uploaded document
+            const [doc] = await db.query(
+                `SELECT id, file_name AS filename, document_type, file_path, upload_date
+                 FROM patient_documents 
+                 WHERE id = ? AND patient_id = ? AND (document_type = 'prescription' OR document_type IS NULL)`,
+                [prescriptionId, patientId]
+            );
+            
+            if (doc.length === 0) {
+                console.error(`Prescription document not found - ID: ${prescriptionId}, Patient ID: ${patientId}`);
+                // Try without document_type filter in case it's not set
+                const [docRetry] = await db.query(
+                    `SELECT id, file_name AS filename, document_type, file_path, upload_date
+                     FROM patient_documents 
+                     WHERE id = ? AND patient_id = ?`,
+                    [prescriptionId, patientId]
+                );
+                
+                if (docRetry.length === 0) {
+                    return res.status(404).json({ 
+                        error: 'Prescription or document not found',
+                        details: `Document ID ${prescriptionId} not found for patient ${patientId}`
+                    });
+                }
+                
+                // Use the retry result
+                doc.push(docRetry[0]);
+            }
+            
+            isUploadedDoc = true;
+            prescriptionData = {
+                medication: doc[0].filename || doc[0].file_name || 'Prescription Document',
+                strength: 'See document',
+                dosage: 'See document',
+                frequency: 'See document',
+                duration: 'See document',
+                instructions: 'Please refer to the uploaded prescription document for details.',
+                source: 'uploaded',
+                uploadDate: doc[0].upload_date,
+                filename: doc[0].filename || doc[0].file_name
+            };
+        }
+        
+        // Create patient-friendly prompt for single prescription
+        const prompt = `You are a helpful medical assistant providing patient-friendly medication instructions. Analyze this prescription and provide clear, easy-to-understand guidance for the patient.
+
+Patient Information:
+- Known Allergies: ${allergies}
+
+Prescription Details:
+${isUploadedDoc 
+    ? `- Medication: ${prescriptionData.medication} (Uploaded Document)
+   - Description: ${prescriptionData.instructions}
+   - Uploaded: ${prescriptionData.uploadDate ? new Date(prescriptionData.uploadDate).toLocaleDateString() : 'Recently'}
+   - Note: This is an uploaded prescription document. Provide general guidance based on common practices for prescription medications.`
+    : `- Medication: ${prescriptionData.medication} (${prescriptionData.strength})
+   - Dosage: ${prescriptionData.dosage}
+   - Frequency: ${prescriptionData.frequency}
+   - Duration: ${prescriptionData.duration}
+   - Doctor's Instructions: ${prescriptionData.instructions}`}
+
+Please provide patient-friendly instructions in JSON format:
+{
+  "medication": "${prescriptionData.medication}",
+  "howToTake": "Clear instructions on how to take this medication",
+  "importantNotes": ["Important points"],
+  "sideEffects": ["Common side effects"],
+  "precautions": ["Things to avoid"],
+  "foodInteractions": ["Food or drink interactions"],
+  "whenToContactDoctor": ["When to contact doctor"],
+  "storage": "How to store this medication",
+  "missedDose": "What to do if a dose is missed"
+}`;
+
+        const genAI = getGeminiAI();
+        const modelNames = ['gemini-2.5-flash', 'gemini-2.5-pro', 'gemini-pro-latest'];
+        let text = null;
+        let lastError = null;
+        
+        for (const modelName of modelNames) {
+            try {
+                const model = genAI.getGenerativeModel({ model: modelName });
+                const result = await model.generateContent(prompt);
+                const response = await result.response;
+                text = response.text();
+                break;
+            } catch (apiError) {
+                lastError = apiError;
+                continue;
+            }
+        }
+        
+        if (!text) {
+            throw new Error(`Failed to generate analysis: ${lastError?.message || 'Unknown error'}`);
+        }
+        
+        let aiAnalysis;
+        try {
+            const jsonMatch = text.match(/```json\s*([\s\S]*?)\s*```/) || text.match(/```\s*([\s\S]*?)\s*```/) || [null, text];
+            const jsonText = jsonMatch[1] || text;
+            aiAnalysis = JSON.parse(jsonText);
+        } catch (parseError) {
+            aiAnalysis = {
+                medication: prescriptionData.medication,
+                howToTake: 'Please refer to your doctor\'s instructions or medication label.',
+                importantNotes: ['Always follow your doctor\'s prescribed dosage'],
+                sideEffects: ['Consult your doctor if you experience any unusual symptoms'],
+                precautions: ['Do not stop taking medication without consulting your doctor'],
+                foodInteractions: ['Ask your doctor about food interactions'],
+                whenToContactDoctor: ['If you experience severe side effects or allergic reactions'],
+                storage: 'Store medications in a cool, dry place away from children',
+                missedDose: 'If you miss a dose, take it as soon as you remember'
+            };
+        }
+        
+        res.json({
+            success: true,
+            analysis: aiAnalysis,
+            prescription: prescriptionData
+        });
+    } catch (error) {
+        console.error('Prescription AI Analysis Error:', error);
+        res.status(500).json({ 
+            error: 'Failed to analyze prescription', 
+            details: error.message 
+        });
+    }
+});
+
+// Patient: Get AI suggestions for prescriptions (patient-friendly instructions)
+router.post('/patient/prescriptions/ai-suggestions', authMiddleware, roleMiddleware('patient'), async (req, res) => {
+    try {
+        const userId = req.user.id;
+        
+        // Get patient info
+        const [patient] = await db.query('SELECT id, allergies FROM patients WHERE user_id = ?', [userId]);
+        if (patient.length === 0) {
+            return res.status(404).json({ error: 'Patient profile not found' });
+        }
+        
+        const patientId = patient[0].id;
+        const allergies = patient[0].allergies || 'None known';
+        
+        // Get all active prescriptions from database
+        const [prescriptions] = await db.query(
+            `SELECT pr.*, m.name as medication_name, m.strength 
+             FROM prescriptions pr
+             JOIN medications m ON pr.medication_id = m.id
+             WHERE pr.patient_id = ? 
+             ORDER BY pr.created_at DESC`,
+            [patientId]
+        );
+        
+        // Get uploaded prescription documents
+        const [uploadedDocs] = await db.query(
+            `SELECT id, file_name AS filename, document_type, file_path, upload_date
+             FROM patient_documents 
+             WHERE patient_id = ? AND document_type = 'prescription'
+             ORDER BY upload_date DESC`,
+            [patientId]
+        );
+        
+        if (prescriptions.length === 0 && uploadedDocs.length === 0) {
+            return res.json({
+                success: true,
+                suggestions: {
+                    message: 'No prescriptions found. Please consult with your doctor for medication instructions.',
+                    instructions: []
+                }
+            });
+        }
+        
+        // Prepare prescription data for AI
+        const prescriptionData = prescriptions.map(p => ({
+            medication: p.medication_name,
+            strength: p.strength,
+            dosage: p.dosage,
+            frequency: p.frequency,
+            duration: p.duration,
+            instructions: p.instructions || 'None provided',
+            source: 'database'
+        }));
+        
+        uploadedDocs.forEach(doc => {
+            prescriptionData.push({
+                medication: doc.filename || 'Prescription Document',
+                strength: 'See document',
+                dosage: 'See document',
+                frequency: 'See document',
+                duration: 'See document',
+                instructions: doc.description || 'Please refer to the uploaded prescription document for details.',
+                source: 'uploaded',
+                uploadDate: doc.upload_date
+            });
+        });
+        
+        // Create patient-friendly prompt
+        const prompt = `You are a helpful medical assistant providing patient-friendly medication instructions. Based on the following prescription information, provide clear, easy-to-understand guidance for the patient.
+
+Patient Information:
+- Known Allergies: ${allergies}
+
+Current Prescriptions:
+${prescriptionData.map((p, idx) => {
+            if (p.source === 'uploaded') {
+                return `${idx + 1}. ${p.medication} (Uploaded Document)
+   - Description: ${p.instructions}
+   - Uploaded: ${p.uploadDate ? new Date(p.uploadDate).toLocaleDateString() : 'Recently'}`;
+            } else {
+                return `${idx + 1}. ${p.medication} (${p.strength})
+   - Dosage: ${p.dosage}
+   - Frequency: ${p.frequency}
+   - Duration: ${p.duration}
+   - Doctor's Instructions: ${p.instructions}`;
+            }
+        }).join('\n\n')}
+
+Please provide patient-friendly instructions in JSON format:
+{
+  "instructions": [
+    {
+      "medication": "Medication name",
+      "howToTake": "Clear instructions on how to take this medication",
+      "importantNotes": ["Important points"],
+      "sideEffects": ["Common side effects"],
+      "precautions": ["Things to avoid"],
+      "foodInteractions": ["Food or drink interactions"],
+      "whenToContactDoctor": ["When to contact doctor"]
+    }
+  ],
+  "generalGuidance": {
+    "storage": "How to store medications",
+    "missedDose": "What to do if a dose is missed",
+    "generalTips": ["General tips"]
+  },
+  "warnings": ["Important warnings"]
+}`;
+
+        const genAI = getGeminiAI();
+        const modelNames = ['gemini-2.5-flash', 'gemini-2.5-pro', 'gemini-pro-latest'];
+        let text = null;
+        let lastError = null;
+        
+        for (const modelName of modelNames) {
+            try {
+                const model = genAI.getGenerativeModel({ model: modelName });
+                const result = await model.generateContent(prompt);
+                const response = await result.response;
+                text = response.text();
+                break;
+            } catch (apiError) {
+                lastError = apiError;
+                continue;
+            }
+        }
+        
+        if (!text) {
+            throw new Error(`Failed to generate instructions: ${lastError?.message || 'Unknown error'}`);
+        }
+        
+        let aiSuggestions;
+        try {
+            const jsonMatch = text.match(/```json\s*([\s\S]*?)\s*```/) || text.match(/```\s*([\s\S]*?)\s*```/) || [null, text];
+            const jsonText = jsonMatch[1] || text;
+            aiSuggestions = JSON.parse(jsonText);
+        } catch (parseError) {
+            aiSuggestions = {
+                rawResponse: text,
+                instructions: prescriptionData.map(p => ({
+                    medication: p.medication,
+                    howToTake: 'Please refer to your doctor\'s instructions.',
+                    importantNotes: ['Always follow your doctor\'s prescribed dosage'],
+                    sideEffects: ['Consult your doctor if you experience any unusual symptoms'],
+                    precautions: ['Do not stop taking medication without consulting your doctor'],
+                    foodInteractions: ['Ask your doctor about food interactions'],
+                    whenToContactDoctor: ['If you experience severe side effects or allergic reactions']
+                })),
+                generalGuidance: {
+                    storage: 'Store medications in a cool, dry place away from children',
+                    missedDose: 'If you miss a dose, take it as soon as you remember',
+                    generalTips: ['Take medications at the same time each day']
+                },
+                warnings: allergies !== 'None known' ? [`Be aware of your allergies: ${allergies}`] : []
+            };
+        }
+        
+        res.json({
+            success: true,
+            suggestions: aiSuggestions,
+            prescriptionCount: prescriptions.length + uploadedDocs.length
+        });
+    } catch (error) {
+        console.error('Patient Prescription AI Error:', error);
+        res.status(500).json({ 
+            error: 'Failed to generate medication instructions', 
+            details: error.message 
+        });
     }
 });
 
@@ -650,11 +1189,12 @@ router.post('/patient/documents/upload', authMiddleware, roleMiddleware('patient
 
         const patientId = patients[0].id;
 
-        // Insert document record
+        // Insert document record - using correct column names from schema
+        // Note: description column doesn't exist in the table, so we'll store it in a note or skip it
         const [result] = await db.query(
-            `INSERT INTO patient_documents (patient_id, document_type, filename, file_path, description, upload_date) 
-             VALUES (?, ?, ?, ?, ?, NOW())`,
-            [patientId, documentType, filename, filename, description]
+            `INSERT INTO patient_documents (patient_id, document_type, file_name, file_path, uploaded_by) 
+             VALUES (?, ?, ?, ?, ?)`,
+            [patientId, documentType, filename, filename || `document_${Date.now()}`, req.user.id]
         );
 
         res.json({ success: true, message: 'Document uploaded', documentId: result.insertId });
@@ -673,11 +1213,21 @@ router.get('/patient/documents', authMiddleware, roleMiddleware('patient'), asyn
 
         const patientId = patients[0].id;
         const [documents] = await db.query(
-            `SELECT * FROM patient_documents WHERE patient_id = ? ORDER BY upload_date DESC`,
+            `SELECT id, patient_id, document_type, file_name AS filename, file_path, uploaded_by, upload_date
+             FROM patient_documents 
+             WHERE patient_id = ? 
+             ORDER BY upload_date DESC`,
             [patientId]
         );
 
-        res.json({ success: true, documents });
+        // Map documents to include filename field for frontend compatibility
+        const mappedDocuments = documents.map(doc => ({
+            ...doc,
+            filename: doc.filename || doc.file_name,
+            description: doc.description || '' // Will be empty since column doesn't exist
+        }));
+
+        res.json({ success: true, documents: mappedDocuments });
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
@@ -707,11 +1257,20 @@ router.get('/patient/documents/:documentId', authMiddleware, roleMiddleware('pat
 router.get('/doctor/patient/:patientId/documents', authMiddleware, roleMiddleware('doctor'), async (req, res) => {
     try {
         const [documents] = await db.query(
-            `SELECT * FROM patient_documents WHERE patient_id = ? ORDER BY upload_date DESC`,
+            `SELECT id, patient_id, document_type, file_name AS filename, file_path, uploaded_by, upload_date
+             FROM patient_documents 
+             WHERE patient_id = ? 
+             ORDER BY upload_date DESC`,
             [req.params.patientId]
         );
 
-        res.json({ success: true, documents });
+        // Map documents to include filename field for frontend compatibility
+        const mappedDocuments = documents.map(doc => ({
+            ...doc,
+            filename: doc.filename || doc.file_name
+        }));
+
+        res.json({ success: true, documents: mappedDocuments });
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
