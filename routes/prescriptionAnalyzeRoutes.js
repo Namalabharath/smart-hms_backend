@@ -1,9 +1,17 @@
 const express = require('express');
 const multer = require('multer');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
+const db = require('../config/database');
+const { authMiddleware, roleMiddleware } = require('../middleware/authMiddleware');
 const router = express.Router();
 
 const upload = multer({ storage: multer.memoryStorage() });
+const fs = require('fs');
+const path = require('path');
+
+// Feature flag: when not explicitly 'true', AI analysis is disabled and route
+// will only save the uploaded file and return success.
+const AI_ENABLED = process.env.AI_ENABLED === 'true';
 
 // Helper: Get Gemini instance
 const getGeminiAI = () => {
@@ -17,14 +25,25 @@ const getGeminiAI = () => {
  * (multipart with 'file', opt 'notes' field)
  * Returns: { success, analysis, details?, error? }
  */
-router.post('/prescription-analyze', upload.single('file'), async (req, res) => {
+router.post('/prescription-analyze', authMiddleware, roleMiddleware('patient'), upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
     const notes = req.body.notes || '';
+    const filename = req.file.originalname || `upload_${Date.now()}`;
+    const userId = req.user.id;
+
+    // If AI analysis is disabled via env flag, return error - this route is for analysis only
+    if (!AI_ENABLED) {
+      return res.status(503).json({ 
+        success: false,
+        error: 'AI analysis is currently disabled. Please use the Documents tab to upload files.' 
+      });
+    }
+
+    // AI analysis enabled: proceed to call Gemini
     // Use file name + notes for context
     const base64file = req.file.buffer.toString('base64');
-    const filename = req.file.originalname;
-
+    
     // Short, firm prompt -- LLM can't read the PDF but can simulate instruction
     const prompt = `Provide clear, patient-friendly medication instructions based on this prescription:
 File Name: ${filename}
@@ -38,7 +57,7 @@ Format:
  "sideEffects": ["..."],
  "precautions": ["..."],
  "whenToContactDoctor": ["..."],
- "warnings": ["..."]
+ "warnings": ["..." ]
 }
 `;
     
@@ -74,3 +93,4 @@ Format:
 });
 
 module.exports = router;
+

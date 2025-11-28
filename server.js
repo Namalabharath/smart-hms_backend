@@ -80,7 +80,7 @@ try {
     // Inventory Manager routes
     app.use('/api/inventory-manager', inventoryManagerRoutes);
 
-    // Prescription Analyze routes
+    // Prescription Analysis routes
     app.use('/api', prescriptionAnalyzeRoutes);
 
     // ============================================

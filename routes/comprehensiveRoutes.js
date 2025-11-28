@@ -3,8 +3,29 @@ const axios = require('axios');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const db = require('../config/database');
 const { authMiddleware, roleMiddleware } = require('../middleware/authMiddleware');
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
 
 const router = express.Router();
+
+// Configure multer for patient document uploads
+const uploadDir = path.join(__dirname, '..', 'uploads', 'patient_documents');
+if (!fs.existsSync(uploadDir)) {
+    fs.mkdirSync(uploadDir, { recursive: true });
+}
+
+const storage = multer.diskStorage({
+    destination: (req, file, cb) => {
+        cb(null, uploadDir);
+    },
+    filename: (req, file, cb) => {
+        const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+        cb(null, file.fieldname + '-' + uniqueSuffix + path.extname(file.originalname));
+    }
+});
+
+const upload = multer({ storage: storage, limits: { fileSize: 10 * 1024 * 1024 } }); // 10MB limit
 
 // Function to get Gemini AI instance
 const getGeminiAI = () => {
@@ -452,31 +473,15 @@ router.post('/patient/prescription/:prescriptionId/ai-analysis', authMiddleware,
         } else {
             // Check if it's an uploaded document
             const [doc] = await db.query(
-                `SELECT id, file_name AS filename, document_type, file_path, upload_date
+                `SELECT id, file_name AS filename, document_type, file_path, upload_date, created_at,
+                        COALESCE(description, '') AS description
                  FROM patient_documents 
-                 WHERE id = ? AND patient_id = ? AND (document_type = 'prescription' OR document_type IS NULL)`,
+                 WHERE id = ? AND patient_id = ? AND document_type = 'prescription'`,
                 [prescriptionId, patientId]
             );
             
             if (doc.length === 0) {
-                console.error(`Prescription document not found - ID: ${prescriptionId}, Patient ID: ${patientId}`);
-                // Try without document_type filter in case it's not set
-                const [docRetry] = await db.query(
-                    `SELECT id, file_name AS filename, document_type, file_path, upload_date
-                     FROM patient_documents 
-                     WHERE id = ? AND patient_id = ?`,
-                    [prescriptionId, patientId]
-                );
-                
-                if (docRetry.length === 0) {
-                    return res.status(404).json({ 
-                        error: 'Prescription or document not found',
-                        details: `Document ID ${prescriptionId} not found for patient ${patientId}`
-                    });
-                }
-                
-                // Use the retry result
-                doc.push(docRetry[0]);
+                return res.status(404).json({ error: 'Prescription or document not found' });
             }
             
             isUploadedDoc = true;
@@ -486,9 +491,9 @@ router.post('/patient/prescription/:prescriptionId/ai-analysis', authMiddleware,
                 dosage: 'See document',
                 frequency: 'See document',
                 duration: 'See document',
-                instructions: 'Please refer to the uploaded prescription document for details.',
+                instructions: doc[0].description || 'Please refer to the uploaded prescription document for details.',
                 source: 'uploaded',
-                uploadDate: doc[0].upload_date,
+                uploadDate: doc[0].upload_date || doc[0].created_at,
                 filename: doc[0].filename || doc[0].file_name
             };
         }
@@ -605,10 +610,11 @@ router.post('/patient/prescriptions/ai-suggestions', authMiddleware, roleMiddlew
         
         // Get uploaded prescription documents
         const [uploadedDocs] = await db.query(
-            `SELECT id, file_name AS filename, document_type, file_path, upload_date
+            `SELECT id, file_name AS filename, document_type, file_path, upload_date, created_at,
+                    COALESCE(description, '') AS description
              FROM patient_documents 
              WHERE patient_id = ? AND document_type = 'prescription'
-             ORDER BY upload_date DESC`,
+             ORDER BY COALESCE(upload_date, created_at) DESC`,
             [patientId]
         );
         
@@ -1176,29 +1182,40 @@ router.get('/dashboard-summary', authMiddleware, async (req, res) => {
 // ============================================
 
 // Patient: Upload document
-router.post('/patient/documents/upload', authMiddleware, roleMiddleware('patient'), async (req, res) => {
+router.post('/patient/documents/upload', authMiddleware, roleMiddleware('patient'), upload.single('fileContent'), async (req, res) => {
     try {
-        const { userId } = req.user;
-        const { documentType, filename, fileContent, description } = req.body;
+        if (!req.file) {
+            return res.status(400).json({ error: 'No file uploaded' });
+        }
 
-        // Get patient ID
-        const [patients] = await db.query('SELECT id FROM patients WHERE user_id = ?', [req.user.id]);
+        const { documentType, description } = req.body;
+
+        // Get patient ID - create patient record if it doesn't exist
+        let [patients] = await db.query('SELECT id FROM patients WHERE user_id = ?', [req.user.id]);
+        
         if (patients.length === 0) {
-            return res.status(404).json({ error: 'Patient record not found' });
+            // Create patient record if missing
+            const [insertResult] = await db.query('INSERT INTO patients (user_id) VALUES (?)', [req.user.id]);
+            patients = [{ id: insertResult.insertId }];
         }
 
         const patientId = patients[0].id;
 
-        // Insert document record - using correct column names from schema
-        // Note: description column doesn't exist in the table, so we'll store it in a note or skip it
+        // Insert document record with actual file path
         const [result] = await db.query(
-            `INSERT INTO patient_documents (patient_id, document_type, file_name, file_path, uploaded_by) 
-             VALUES (?, ?, ?, ?, ?)`,
-            [patientId, documentType, filename, filename || `document_${Date.now()}`, req.user.id]
+            `INSERT INTO patient_documents (patient_id, document_type, file_name, file_path, uploaded_by, upload_date, description) 
+             VALUES (?, ?, ?, ?, ?, NOW(), ?)`,
+            [patientId, documentType || 'general', req.file.originalname, req.file.path, req.user.id, description || '']
         );
 
-        res.json({ success: true, message: 'Document uploaded', documentId: result.insertId });
+        res.json({ 
+            success: true, 
+            message: 'Document uploaded successfully', 
+            documentId: result.insertId,
+            filename: req.file.originalname
+        });
     } catch (error) {
+        console.error('Upload error:', error);
         res.status(500).json({ error: error.message });
     }
 });
@@ -1213,7 +1230,9 @@ router.get('/patient/documents', authMiddleware, roleMiddleware('patient'), asyn
 
         const patientId = patients[0].id;
         const [documents] = await db.query(
-            `SELECT id, patient_id, document_type, file_name AS filename, file_path, uploaded_by, upload_date
+            `SELECT id, patient_id, document_type, file_name AS filename, file_path, uploaded_by, 
+                    upload_date,
+                    COALESCE(description, '') AS description
              FROM patient_documents 
              WHERE patient_id = ? 
              ORDER BY upload_date DESC`,
@@ -1224,7 +1243,7 @@ router.get('/patient/documents', authMiddleware, roleMiddleware('patient'), asyn
         const mappedDocuments = documents.map(doc => ({
             ...doc,
             filename: doc.filename || doc.file_name,
-            description: doc.description || '' // Will be empty since column doesn't exist
+            upload_date: doc.upload_date
         }));
 
         res.json({ success: true, documents: mappedDocuments });
@@ -1247,8 +1266,23 @@ router.get('/patient/documents/:documentId', authMiddleware, roleMiddleware('pat
             return res.status(404).json({ error: 'Document not found' });
         }
 
-        res.json({ success: true, document: documents[0] });
+        const doc = documents[0];
+        const filePath = doc.file_path;
+
+        // Check if file exists
+        if (!fs.existsSync(filePath)) {
+            return res.status(404).json({ error: 'File not found on server' });
+        }
+
+        // Send file for download
+        res.download(filePath, doc.file_name, (err) => {
+            if (err) {
+                console.error('Download error:', err);
+                res.status(500).json({ error: 'Failed to download file' });
+            }
+        });
     } catch (error) {
+        console.error('Download error:', error);
         res.status(500).json({ error: error.message });
     }
 });
@@ -1257,7 +1291,8 @@ router.get('/patient/documents/:documentId', authMiddleware, roleMiddleware('pat
 router.get('/doctor/patient/:patientId/documents', authMiddleware, roleMiddleware('doctor'), async (req, res) => {
     try {
         const [documents] = await db.query(
-            `SELECT id, patient_id, document_type, file_name AS filename, file_path, uploaded_by, upload_date
+            `SELECT id, patient_id, document_type, file_name AS filename, file_path, uploaded_by, 
+                    upload_date
              FROM patient_documents 
              WHERE patient_id = ? 
              ORDER BY upload_date DESC`,
@@ -1267,7 +1302,8 @@ router.get('/doctor/patient/:patientId/documents', authMiddleware, roleMiddlewar
         // Map documents to include filename field for frontend compatibility
         const mappedDocuments = documents.map(doc => ({
             ...doc,
-            filename: doc.filename || doc.file_name
+            filename: doc.filename || doc.file_name,
+            upload_date: doc.upload_date
         }));
 
         res.json({ success: true, documents: mappedDocuments });
